@@ -26,6 +26,7 @@ import { askChainQuant } from './services/aiCommandService.js';
 import { attachUser, requireUser } from './lib/auth.js';
 import { balances, priceHoldings } from './services/balanceService.js';
 import { comboRead } from './services/scoringService.js';
+import { telegramMembers } from './services/telegramService.js';
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -108,6 +109,15 @@ app.get('/api/narratives/rotation', wrap(async (_req, res) => res.json(await rot
 
 /* ── Social: honest unavailability ───────────────────────────────────────── */
 app.get('/api/social/:symbol', wrap(async (req, res) => res.json(await socialMomentum(req.params.symbol))));
+app.get('/api/telegram/:symbol', wrap(async (req, res) => res.json(await telegramMembers(req.params.symbol))));
+
+app.get('/api/news', wrap(async (req, res) => {
+  const row = await getCache('news:crypto');
+  if (!row) return res.json(unavailable('Marketaux cache', 'No verified news snapshot is available yet. Configure MARKETAUX_API_TOKEN and allow the worker to refresh.'));
+  const symbol = String(req.query.symbol || '').toUpperCase();
+  const articles = symbol ? row.payload.filter((a) => (a.entities || []).includes(symbol)) : row.payload;
+  res.json(delayed(articles, row.source, row.fetched_at, 'Verified source headlines cached globally for all users.'));
+}));
 
 /* ── Wallets ─────────────────────────────────────────────────────────────── */
 /**
@@ -162,6 +172,22 @@ app.get('/api/whales', wrap(async (req, res) => {
 }));
 
 app.get('/api/wallet/index-status', wrap(async (_req, res) => res.json(envelope(await indexReadiness(), { status: STATUS.LIVE, source: 'ChainQuant proxy index' }))));
+app.get('/api/whales/summary', wrap(async (req, res) => {
+  if (!db) return res.json(unavailable('Supabase', 'Database not configured.'));
+  const hours = Math.min(Math.max(Number(req.query.hours || 24), 1), 168);
+  const since = new Date(Date.now() - hours * 3600000).toISOString();
+  const { data } = await db.from('wallet_observations').select('network,token_symbol,side,volume_usd,wallet_address,observed_at').gte('observed_at', since);
+  if (!data?.length) return res.json(unavailable('ChainQuant pool feed', `No pool trades were observed in the last ${hours} hour(s).`));
+  const byAsset = {};
+  for (const t of data) {
+    const key = `${t.network}:${t.token_symbol || '?'}`;
+    const x = byAsset[key] ||= { network: t.network, token_symbol: t.token_symbol, buys_usd: 0, sells_usd: 0, observed_trades: 0, wallets: new Set() };
+    x[t.side === 'buy' ? 'buys_usd' : 'sells_usd'] += Number(t.volume_usd || 0);
+    x.observed_trades++; x.wallets.add(t.wallet_address);
+  }
+  const value = Object.values(byAsset).map((x) => ({ network: x.network, token_symbol: x.token_symbol, buys_usd: x.buys_usd, sells_usd: x.sells_usd, net_flow_usd: x.buys_usd - x.sells_usd, observed_trades: x.observed_trades, distinct_observed_wallets: x.wallets.size })).sort((a, b) => Math.abs(b.net_flow_usd) - Math.abs(a.net_flow_usd));
+  res.json(envelope({ window_hours: hours, assets: value }, { status: STATUS.DELAYED, source: 'ChainQuant global GeckoTerminal observations', note: 'Shared global observed-pool coverage, not all blockchain or exchange trades.' }));
+}));
 app.get('/api/wallet/:address', wrap(async (req, res) => res.json(await walletProfile(req.params.address))));
 
 /* ── Alerts: parse → review → save. Never save silently. ─────────────────── */
